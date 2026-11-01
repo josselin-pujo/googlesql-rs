@@ -1,0 +1,2262 @@
+//! End-to-end tests for the analyzer (`AnalyzeStatement`).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "test code"
+)]
+
+use googlesql::{
+    Catalog, ColumnDef, ColumnType, ConstantDef, ConstantValue, EnumDef, EnumValue, Error,
+    FunctionDef, FunctionKind, GraphEdgeTableDef, GraphLabelDef, GraphNodeReferenceDef,
+    GraphNodeTableDef, GraphPropertyDef, LanguageFeature, Module, NamedCatalog, NamedType,
+    ProcedureDef, ProductMode, PropertyGraphDef, QueryParameter, StatementKind, StructField,
+    TableDef, TvfArgument, TvfDef,
+};
+
+#[test]
+fn analyzes_literal_select() {
+    let mut module = Module::new().unwrap();
+
+    // A literal SELECT needs no catalog entries, so it resolves against an
+    // empty catalog.
+    let result = module.analyze_statement("SELECT 1");
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_builtin_operator() {
+    let mut module = Module::new().unwrap();
+
+    // `+` resolves to the builtin `$add` function, which requires the builtin
+    // functions to be registered in the catalog.
+    let result = module.analyze_statement("SELECT 1 + 2 AS x");
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn returns_error_for_unknown_table() {
+    let mut module = Module::new().unwrap();
+
+    // The catalog is empty, so referencing a table fails name resolution.
+    let result = module.analyze_statement("SELECT x FROM missing_table");
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analysis_error_carries_its_source_location() {
+    let mut module = Module::new().unwrap();
+
+    let users = TableDef {
+        name: "users".to_string(),
+        columns: vec![ColumnDef {
+            name: "id".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // `missing_col` starts at column 8 of the single-line query; GoogleSQL
+    // reports the error there, and we expose that position structurally.
+    let Err(Error::GoogleSql(err)) =
+        module.analyze_output_columns("SELECT missing_col FROM users", &[users])
+    else {
+        panic!("expected an unresolved-name error");
+    };
+
+    assert_eq!(
+        err.location().map(|loc| (loc.line(), loc.column())),
+        Some((1, 8))
+    );
+    assert!(
+        err.message().starts_with("Unrecognized name: missing_col"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn returns_error_for_invalid_sql() {
+    let mut module = Module::new().unwrap();
+
+    let result = module.analyze_statement("SELECT FROM");
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_query_against_user_table() {
+    let mut module = Module::new().unwrap();
+
+    let users = TableDef {
+        name: "users".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "id".to_string(),
+                ty: ColumnType::Int64,
+            },
+            ColumnDef {
+                name: "name".to_string(),
+                ty: ColumnType::String,
+            },
+        ],
+    };
+
+    // With the table registered in the catalog, its columns resolve.
+    let result = module.analyze_statement_with_catalog("SELECT id, name FROM users", &[users]);
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_qualify_clause() {
+    let mut module = Module::new().unwrap();
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                ty: ColumnType::Int64,
+            },
+        ],
+    };
+
+    // `QUALIFY` is gated behind a GoogleSQL language feature; the analyzer
+    // enables the maximum language feature set so the clause resolves.
+    let result = module.analyze_statement_with_catalog(
+        "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) = 1",
+        &[t],
+    );
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn returns_error_for_unknown_column_in_user_table() {
+    let mut module = Module::new().unwrap();
+
+    let users = TableDef {
+        name: "users".to_string(),
+        columns: vec![ColumnDef {
+            name: "id".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // The table exists but the column does not, so name resolution fails.
+    let result = module.analyze_statement_with_catalog("SELECT missing_col FROM users", &[users]);
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_columns_of_each_scalar_type() {
+    let mut module = Module::new().unwrap();
+
+    // Each ColumnType maps to a TypeFactory getter; registering a column of that
+    // type and reading back the resolved output column's type name proves the
+    // round-trip (SQL type name == the type we asked the factory for).
+    let cases = [
+        (ColumnType::Bytes, "BYTES"),
+        (ColumnType::Date, "DATE"),
+        (ColumnType::Datetime, "DATETIME"),
+        (ColumnType::Time, "TIME"),
+        (ColumnType::Timestamp, "TIMESTAMP"),
+        (ColumnType::Numeric, "NUMERIC"),
+        (ColumnType::BigNumeric, "BIGNUMERIC"),
+        (ColumnType::Json, "JSON"),
+        (ColumnType::Interval, "INTERVAL"),
+        (ColumnType::Geography, "GEOGRAPHY"),
+    ];
+
+    for (ty, expected) in cases {
+        let table = TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "c".to_string(),
+                ty,
+            }],
+        };
+
+        let columns = module
+            .analyze_output_columns("SELECT c FROM t", &[table])
+            .unwrap_or_else(|e| panic!("analysis failed for {expected}: {e:?}"));
+
+        assert_eq!(
+            columns.len(),
+            1,
+            "expected one output column for {expected}"
+        );
+        assert_eq!(
+            columns[0].type_name(),
+            expected,
+            "resolved type name mismatch for {expected}"
+        );
+    }
+}
+
+#[test]
+fn resolves_an_array_column() {
+    let mut module = Module::new().unwrap();
+
+    // An ARRAY<STRING> column: the element type is built first, then wrapped in
+    // an array type, and the resolved output column's type name proves the
+    // round-trip end to end.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "tags".to_string(),
+            ty: ColumnType::Array(Box::new(ColumnType::String)),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT tags FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "ARRAY<STRING>");
+}
+
+#[test]
+fn unnests_an_array_column() {
+    let mut module = Module::new().unwrap();
+
+    // The array column is usable as a table source via UNNEST, and each element
+    // resolves to the array's element type.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "scores".to_string(),
+            ty: ColumnType::Array(Box::new(ColumnType::Int64)),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT s FROM t, UNNEST(scores) AS s", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn resolves_a_struct_column() {
+    let mut module = Module::new().unwrap();
+
+    // A STRUCT<x INT64, y INT64> column: each field type is built and named,
+    // then assembled into a struct type. The resolved output column's type name
+    // proves fields keep their names, types, and order.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "point".to_string(),
+            ty: ColumnType::Struct(vec![
+                StructField {
+                    name: "x".to_string(),
+                    ty: ColumnType::Int64,
+                },
+                StructField {
+                    name: "y".to_string(),
+                    ty: ColumnType::Int64,
+                },
+            ]),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT point FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "STRUCT<x INT64, y INT64>");
+}
+
+#[test]
+fn resolves_a_field_of_a_struct_column() {
+    let mut module = Module::new().unwrap();
+
+    // A struct field is reachable by name and resolves to its declared type.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "p".to_string(),
+            ty: ColumnType::Struct(vec![StructField {
+                name: "label".to_string(),
+                ty: ColumnType::String,
+            }]),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT p.label FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "STRING");
+}
+
+#[test]
+fn resolves_an_array_of_structs_column() {
+    let mut module = Module::new().unwrap();
+
+    // Composition: the recursive builder handles ARRAY<STRUCT<...>>.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "items".to_string(),
+            ty: ColumnType::Array(Box::new(ColumnType::Struct(vec![StructField {
+                name: "n".to_string(),
+                ty: ColumnType::Int64,
+            }]))),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT items FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "ARRAY<STRUCT<n INT64>>");
+}
+
+#[test]
+fn resolves_a_registered_scalar_function() {
+    let mut module = Module::new().unwrap();
+
+    // A user-defined scalar function my_add(INT64, INT64) -> INT64. Without the
+    // registration the call is an unrecognized-function error.
+    let catalog = Catalog {
+        tables: vec![],
+        functions: vec![FunctionDef {
+            name: "my_add".to_string(),
+            arguments: vec![ColumnType::Int64, ColumnType::Int64],
+            return_type: ColumnType::Int64,
+            kind: FunctionKind::Scalar,
+        }],
+        constants: vec![],
+        parameters: vec![],
+        table_functions: vec![],
+        catalogs: vec![],
+        procedures: vec![],
+        connections: vec![],
+        types: vec![],
+        enums: vec![],
+        proto_files: vec![],
+        property_graphs: vec![],
+        expression_columns: vec![],
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT my_add(1, 2) AS s", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn resolves_a_registered_aggregate_function() {
+    let mut module = Module::new().unwrap();
+
+    // A user-defined aggregate function my_agg(INT64) -> INT64. Registering it
+    // with aggregate mode lets it be called with aggregate semantics over a
+    // table column; a scalar registration would reject the aggregate call.
+    let catalog = Catalog {
+        tables: vec![TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "n".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        functions: vec![FunctionDef {
+            name: "my_agg".to_string(),
+            arguments: vec![ColumnType::Int64],
+            return_type: ColumnType::Int64,
+            kind: FunctionKind::Aggregate,
+        }],
+        constants: vec![],
+        parameters: vec![],
+        table_functions: vec![],
+        catalogs: vec![],
+        procedures: vec![],
+        connections: vec![],
+        types: vec![],
+        enums: vec![],
+        proto_files: vec![],
+        property_graphs: vec![],
+        expression_columns: vec![],
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT my_agg(n) AS s FROM t", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn registered_function_type_checks_its_arguments() {
+    let mut module = Module::new().unwrap();
+
+    // The signature's argument types are enforced: passing a STRING where INT64
+    // is declared must fail to resolve.
+    let catalog = Catalog {
+        tables: vec![],
+        functions: vec![FunctionDef {
+            name: "needs_int".to_string(),
+            arguments: vec![ColumnType::Int64],
+            return_type: ColumnType::Bool,
+            kind: FunctionKind::Scalar,
+        }],
+        constants: vec![],
+        parameters: vec![],
+        table_functions: vec![],
+        catalogs: vec![],
+        procedures: vec![],
+        connections: vec![],
+        types: vec![],
+        enums: vec![],
+        proto_files: vec![],
+        property_graphs: vec![],
+        expression_columns: vec![],
+    };
+
+    let result = module.analyze_statement_in("SELECT needs_int('x')", &catalog);
+    assert!(result.is_err(), "argument type mismatch must not resolve");
+}
+
+#[test]
+fn resolves_a_registered_named_constant() {
+    let mut module = Module::new().unwrap();
+
+    // A named constant my_const of type INT64. Registering it lets the bare name
+    // resolve as an expression yielding the constant's type; without it the name
+    // is an unrecognized-column/name error.
+    let catalog = Catalog {
+        constants: vec![ConstantDef {
+            name: "my_const".to_string(),
+            value: ConstantValue::Int64(42),
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT my_const AS c", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn registered_string_constant_resolves_with_its_type() {
+    let mut module = Module::new().unwrap();
+
+    let catalog = Catalog {
+        constants: vec![ConstantDef {
+            name: "greeting".to_string(),
+            value: ConstantValue::String("hi".to_string()),
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT greeting AS g", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "STRING");
+}
+
+#[test]
+fn resolves_constants_of_each_scalar_value_type() {
+    let mut module = Module::new().unwrap();
+
+    // Exercises every ConstantValue variant, including a negative INT64 (the
+    // full two's-complement varint path) and a DOUBLE (fixed64 encoding).
+    let catalog = Catalog {
+        constants: vec![
+            ConstantDef {
+                name: "neg".to_string(),
+                value: ConstantValue::Int64(-7),
+            },
+            ConstantDef {
+                name: "ratio".to_string(),
+                value: ConstantValue::Double(3.5),
+            },
+            ConstantDef {
+                name: "flag".to_string(),
+                value: ConstantValue::Bool(true),
+            },
+        ],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT neg AS a, ratio AS b, flag AS c", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 3);
+    assert_eq!(columns[0].type_name(), "INT64");
+    assert_eq!(columns[1].type_name(), "DOUBLE");
+    assert_eq!(columns[2].type_name(), "BOOL");
+}
+
+#[test]
+fn declared_query_parameter_resolves_with_its_type() {
+    let mut module = Module::new().unwrap();
+
+    // Declaring @id as INT64 lets `SELECT @id` resolve to a known INT64 output
+    // type, rather than an inferred/unknown parameter type.
+    let catalog = Catalog {
+        parameters: vec![QueryParameter {
+            name: "id".to_string(),
+            ty: ColumnType::Int64,
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT @id AS v", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn declared_query_parameter_type_checks_its_uses() {
+    let mut module = Module::new().unwrap();
+
+    // @n is declared INT64, so using it where a STRING is required must fail to
+    // resolve — the declared type is enforced.
+    let catalog = Catalog {
+        parameters: vec![QueryParameter {
+            name: "n".to_string(),
+            ty: ColumnType::Int64,
+        }],
+        ..Catalog::default()
+    };
+
+    // `NOT` requires BOOL, so applying it to the INT64 parameter must fail.
+    let result = module.analyze_statement_in("SELECT NOT @n", &catalog);
+    assert!(result.is_err(), "declared parameter type must be enforced");
+}
+
+#[test]
+fn unregistered_function_does_not_resolve() {
+    let mut module = Module::new().unwrap();
+
+    let empty = Catalog::default();
+    let result = module.analyze_statement_in("SELECT my_add(1, 2)", &empty);
+    assert!(result.is_err(), "unregistered function must not resolve");
+}
+
+#[test]
+fn analyzes_insert_statement() {
+    let mut module = Module::new().unwrap();
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // INSERT is a DML statement kind; the analyzer must be told to accept
+    // statement kinds beyond query for it to resolve.
+    let result = module.analyze_statement_with_catalog("INSERT INTO t (a) VALUES (1)", &[t]);
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_update_statement() {
+    let mut module = Module::new().unwrap();
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    let result = module.analyze_statement_with_catalog("UPDATE t SET a = 1 WHERE a = 2", &[t]);
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_delete_statement() {
+    let mut module = Module::new().unwrap();
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    let result = module.analyze_statement_with_catalog("DELETE FROM t WHERE a = 1", &[t]);
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_create_table_statement() {
+    let mut module = Module::new().unwrap();
+
+    // CREATE TABLE is a DDL statement kind and needs no catalog entries.
+    let result = module.analyze_statement_with_catalog("CREATE TABLE t (a INT64)", &[]);
+
+    assert!(
+        result.is_ok(),
+        "expected analysis to succeed, got: {result:?}"
+    );
+}
+
+#[test]
+fn output_columns_of_dml_is_empty_for_now() {
+    let mut module = Module::new().unwrap();
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // Output-column extraction is defined only for `ResolvedQueryStmt`. A DML
+    // statement now analyzes successfully but projects no query output columns,
+    // so the result is empty rather than an error. Surfacing DML-specific
+    // structure is left to a later slice.
+    let columns = module
+        .analyze_output_columns("INSERT INTO t (a) VALUES (1)", &[t])
+        .unwrap();
+
+    assert!(
+        columns.is_empty(),
+        "expected no output columns for DML, got {} column(s)",
+        columns.len()
+    );
+}
+
+#[test]
+fn analyze_statement_with_empty_catalog_matches_phase_one() {
+    let mut module = Module::new().unwrap();
+
+    // An empty catalog behaves exactly like `analyze_statement`: a bare literal
+    // resolves, but any table reference fails.
+    assert!(
+        module
+            .analyze_statement_with_catalog("SELECT 1", &[])
+            .is_ok()
+    );
+    assert!(matches!(
+        module.analyze_statement_with_catalog("SELECT x FROM missing_table", &[]),
+        Err(Error::GoogleSql(_))
+    ));
+}
+
+#[test]
+fn restricts_analysis_to_the_supported_statement_kinds() {
+    let mut module = Module::new().unwrap();
+
+    // Only query statements are allowed; DML/DDL kinds fall outside the set.
+    module.set_supported_statement_kinds(&[StatementKind::Query]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // A query is in the allowed set, so it resolves.
+    let query = module.analyze_statement_with_catalog("SELECT a FROM t", std::slice::from_ref(&t));
+    assert!(
+        query.is_ok(),
+        "expected the query to be accepted, got: {query:?}"
+    );
+
+    // INSERT is a DML kind outside the allowed set, so the analyzer rejects it.
+    let insert = module.analyze_statement_with_catalog("INSERT INTO t (a) VALUES (1)", &[t]);
+    assert!(
+        matches!(insert, Err(Error::GoogleSql(_))),
+        "expected INSERT to be rejected, got: {insert:?}"
+    );
+}
+
+#[test]
+fn empty_supported_statement_kinds_allows_every_kind() {
+    let mut module = Module::new().unwrap();
+
+    // An empty set mirrors ZetaSQL's `SetSupportedStatementKinds({})`, which
+    // accepts every kind, so DDL keeps resolving.
+    module.set_supported_statement_kinds(&[]);
+
+    let result = module.analyze_statement_with_catalog("CREATE TABLE t (a INT64)", &[]);
+    assert!(
+        result.is_ok(),
+        "expected CREATE TABLE to be accepted, got: {result:?}"
+    );
+}
+
+#[test]
+fn supported_statement_kinds_can_allow_multiple_kinds() {
+    let mut module = Module::new().unwrap();
+
+    // Restrict to query and INSERT; UPDATE stays outside the set.
+    module.set_supported_statement_kinds(&[StatementKind::Query, StatementKind::Insert]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    let insert = module
+        .analyze_statement_with_catalog("INSERT INTO t (a) VALUES (1)", std::slice::from_ref(&t));
+    assert!(
+        insert.is_ok(),
+        "expected INSERT to be accepted, got: {insert:?}"
+    );
+
+    let update = module.analyze_statement_with_catalog("UPDATE t SET a = 1 WHERE a = 2", &[t]);
+    assert!(
+        matches!(update, Err(Error::GoogleSql(_))),
+        "expected UPDATE to be rejected, got: {update:?}"
+    );
+}
+
+#[test]
+fn disabling_the_qualify_feature_rejects_the_qualify_clause() {
+    let mut module = Module::new().unwrap();
+
+    // QUALIFY is gated behind its own language feature; disabling it makes the
+    // clause fail to resolve even though the maximum feature set is otherwise on.
+    module.disable_language_features(&[LanguageFeature::Qualify]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                ty: ColumnType::Int64,
+            },
+        ],
+    };
+
+    let qualified = module.analyze_statement_with_catalog(
+        "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) = 1",
+        std::slice::from_ref(&t),
+    );
+    assert!(
+        matches!(qualified, Err(Error::GoogleSql(_))),
+        "expected QUALIFY to be rejected, got: {qualified:?}"
+    );
+
+    // A plain query does not use the disabled feature, so it still resolves.
+    let plain = module.analyze_statement_with_catalog("SELECT a FROM t", std::slice::from_ref(&t));
+    assert!(
+        plain.is_ok(),
+        "expected the plain query to be accepted, got: {plain:?}"
+    );
+}
+
+#[test]
+fn disabling_analytic_functions_rejects_window_functions() {
+    let mut module = Module::new().unwrap();
+
+    module.disable_language_features(&[LanguageFeature::AnalyticFunctions]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    let windowed =
+        module.analyze_statement_with_catalog("SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t", &[t]);
+    assert!(
+        matches!(windowed, Err(Error::GoogleSql(_))),
+        "expected the window function to be rejected, got: {windowed:?}"
+    );
+}
+
+#[test]
+fn empty_disabled_feature_set_keeps_the_maximum_features() {
+    let mut module = Module::new().unwrap();
+
+    // An empty set disables nothing, so gated syntax such as QUALIFY still
+    // resolves exactly as it does by default.
+    module.disable_language_features(&[]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                ty: ColumnType::Int64,
+            },
+        ],
+    };
+
+    let result = module.analyze_statement_with_catalog(
+        "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) = 1",
+        &[t],
+    );
+    assert!(
+        result.is_ok(),
+        "expected QUALIFY to be accepted, got: {result:?}"
+    );
+}
+
+#[test]
+fn enabling_only_analytic_functions_starts_from_a_minimal_feature_set() {
+    let mut module = Module::new().unwrap();
+
+    // Start from the minimal feature set (every feature off) and turn on only
+    // analytic functions. Window functions then resolve, but any other gated
+    // feature stays off, proving the base is minimal rather than maximal.
+    module.enable_only_language_features(&[LanguageFeature::AnalyticFunctions]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                ty: ColumnType::Int64,
+            },
+        ],
+    };
+
+    let windowed = module.analyze_statement_with_catalog(
+        "SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t",
+        std::slice::from_ref(&t),
+    );
+    assert!(
+        windowed.is_ok(),
+        "expected the window function to be accepted, got: {windowed:?}"
+    );
+
+    // QUALIFY is gated behind its own feature, which was not enabled, so it is
+    // rejected even though analytic functions are on.
+    let qualified = module.analyze_statement_with_catalog(
+        "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) = 1",
+        std::slice::from_ref(&t),
+    );
+    assert!(
+        matches!(qualified, Err(Error::GoogleSql(_))),
+        "expected QUALIFY to be rejected, got: {qualified:?}"
+    );
+}
+
+#[test]
+fn empty_enabled_feature_set_disables_every_optional_feature() {
+    let mut module = Module::new().unwrap();
+
+    // An empty enable list leaves the minimal set untouched: every optional
+    // feature is off, so gated syntax fails while a plain query still resolves.
+    module.enable_only_language_features(&[]);
+
+    let t = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    let plain = module.analyze_statement_with_catalog("SELECT a FROM t", std::slice::from_ref(&t));
+    assert!(
+        plain.is_ok(),
+        "expected the plain query to be accepted, got: {plain:?}"
+    );
+
+    let windowed = module.analyze_statement_with_catalog(
+        "SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t",
+        std::slice::from_ref(&t),
+    );
+    assert!(
+        matches!(windowed, Err(Error::GoogleSql(_))),
+        "expected the window function to be rejected, got: {windowed:?}"
+    );
+}
+
+#[test]
+fn analyzes_a_table_valued_function() {
+    let mut module = Module::new().unwrap();
+
+    // A fixed-output-schema TVF taking no arguments: calling it in a FROM clause
+    // resolves to its declared output columns.
+    let catalog = Catalog {
+        table_functions: vec![TvfDef {
+            name: "my_tvf".to_string(),
+            arguments: vec![],
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    ty: ColumnType::Int64,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    ty: ColumnType::String,
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT * FROM my_tvf()", &catalog)
+        .unwrap_or_else(|e| panic!("analysis failed: {e:?}"));
+
+    assert_eq!(columns.len(), 2, "expected the TVF's two output columns");
+    assert_eq!(columns[0].name(), "id");
+    assert_eq!(columns[0].type_name(), "INT64");
+    assert_eq!(columns[1].name(), "name");
+    assert_eq!(columns[1].type_name(), "STRING");
+}
+
+#[test]
+fn analyzes_a_table_valued_function_with_a_scalar_argument() {
+    let mut module = Module::new().unwrap();
+
+    // A TVF taking one INT64 argument and returning a fixed one-column schema:
+    // the call type-checks the argument and resolves to the output column.
+    let catalog = Catalog {
+        table_functions: vec![TvfDef {
+            name: "my_tvf".to_string(),
+            arguments: vec![TvfArgument::Scalar(ColumnType::Int64)],
+            columns: vec![ColumnDef {
+                name: "v".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT * FROM my_tvf(5)", &catalog)
+        .unwrap_or_else(|e| panic!("analysis failed: {e:?}"));
+
+    assert_eq!(columns.len(), 1, "expected the TVF's one output column");
+    assert_eq!(columns[0].name(), "v");
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn table_valued_function_type_checks_its_argument() {
+    let mut module = Module::new().unwrap();
+
+    // The argument is declared INT64, so passing a STRING must fail to resolve.
+    let catalog = Catalog {
+        table_functions: vec![TvfDef {
+            name: "my_tvf".to_string(),
+            arguments: vec![TvfArgument::Scalar(ColumnType::Int64)],
+            columns: vec![ColumnDef {
+                name: "v".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let result = module.analyze_statement_in("SELECT * FROM my_tvf('x')", &catalog);
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected an argument type error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_a_table_valued_function_with_an_any_relation_argument() {
+    let mut module = Module::new().unwrap();
+
+    // A TVF taking any table as input and returning a fixed schema: a `TABLE t`
+    // argument referencing a registered table resolves.
+    let catalog = Catalog {
+        tables: vec![TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        table_functions: vec![TvfDef {
+            name: "my_tvf".to_string(),
+            arguments: vec![TvfArgument::AnyRelation],
+            columns: vec![ColumnDef {
+                name: "v".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT * FROM my_tvf(TABLE t)", &catalog)
+        .unwrap_or_else(|e| panic!("analysis failed: {e:?}"));
+
+    assert_eq!(columns.len(), 1, "expected the TVF's one output column");
+    assert_eq!(columns[0].name(), "v");
+    assert_eq!(columns[0].type_name(), "INT64");
+}
+
+#[test]
+fn analyzes_a_table_valued_function_with_a_typed_relation_argument() {
+    let mut module = Module::new().unwrap();
+
+    // A TVF whose input relation must match a schema of `(a INT64)`; a registered
+    // table with that exact schema satisfies it.
+    let catalog = Catalog {
+        tables: vec![TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        table_functions: vec![TvfDef {
+            name: "my_tvf".to_string(),
+            arguments: vec![TvfArgument::Relation(vec![ColumnDef {
+                name: "a".to_string(),
+                ty: ColumnType::Int64,
+            }])],
+            columns: vec![ColumnDef {
+                name: "v".to_string(),
+                ty: ColumnType::Int64,
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let result = module.analyze_statement_in("SELECT * FROM my_tvf(TABLE t)", &catalog);
+    assert!(
+        result.is_ok(),
+        "expected the matching-schema table argument to resolve, got: {result:?}"
+    );
+}
+
+#[test]
+fn rejects_unknown_table_valued_function() {
+    let mut module = Module::new().unwrap();
+
+    // No TVF named `missing_tvf` is registered, so the call fails to resolve.
+    let result = module.analyze_statement_in("SELECT * FROM missing_tvf()", &Catalog::default());
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected an unresolved-function error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_a_query_against_a_nested_catalog() {
+    let mut module = Module::new().unwrap();
+
+    // Register a sub-catalog "ds" holding table "t"; the table then resolves
+    // under the qualified name "ds.t", mirroring a BigQuery dataset.table.
+    let catalog = Catalog {
+        catalogs: vec![NamedCatalog {
+            name: "ds".to_string(),
+            catalog: Catalog {
+                tables: vec![TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "a".to_string(),
+                        ty: ColumnType::Int64,
+                    }],
+                }],
+                ..Catalog::default()
+            },
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in("SELECT a FROM ds.t", &catalog);
+    assert!(
+        result.is_ok(),
+        "expected the qualified table to resolve, got: {result:?}"
+    );
+}
+
+#[test]
+fn nested_catalog_tables_are_not_visible_unqualified() {
+    let mut module = Module::new().unwrap();
+
+    // The table lives only inside the "ds" sub-catalog, so referencing it
+    // without the "ds." prefix must fail: the namespace is not flattened.
+    let catalog = Catalog {
+        catalogs: vec![NamedCatalog {
+            name: "ds".to_string(),
+            catalog: Catalog {
+                tables: vec![TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "a".to_string(),
+                        ty: ColumnType::Int64,
+                    }],
+                }],
+                ..Catalog::default()
+            },
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in("SELECT a FROM t", &catalog);
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected the unqualified table to be unresolved, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_a_query_against_a_two_level_nested_catalog() {
+    let mut module = Module::new().unwrap();
+
+    // Nest catalogs two deep ("a" -> "b" -> table "t") so the table resolves
+    // under the fully qualified "a.b.t".
+    let catalog = Catalog {
+        catalogs: vec![NamedCatalog {
+            name: "a".to_string(),
+            catalog: Catalog {
+                catalogs: vec![NamedCatalog {
+                    name: "b".to_string(),
+                    catalog: Catalog {
+                        tables: vec![TableDef {
+                            name: "t".to_string(),
+                            columns: vec![ColumnDef {
+                                name: "n".to_string(),
+                                ty: ColumnType::Int64,
+                            }],
+                        }],
+                        ..Catalog::default()
+                    },
+                }],
+                ..Catalog::default()
+            },
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in("SELECT n FROM a.b.t", &catalog);
+    assert!(
+        result.is_ok(),
+        "expected the two-level qualified table to resolve, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_a_range_column() {
+    let mut module = Module::new().unwrap();
+
+    // A RANGE<DATE> column: the element type (DATE) is built first, then wrapped
+    // in a range type, and the resolved output column's type name proves the
+    // round-trip end to end.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "span".to_string(),
+            ty: ColumnType::Range(Box::new(ColumnType::Date)),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT span FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "RANGE<DATE>");
+}
+
+#[test]
+fn rejects_a_range_of_an_unsupported_element_type() {
+    let mut module = Module::new().unwrap();
+
+    // GoogleSQL only allows RANGE over DATE, DATETIME, or TIMESTAMP, so a
+    // RANGE<INT64> is rejected when the type is built.
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "span".to_string(),
+            ty: ColumnType::Range(Box::new(ColumnType::Int64)),
+        }],
+    };
+
+    let result = module.analyze_output_columns("SELECT span FROM t", &[table]);
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected RANGE<INT64> to be rejected, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_a_map_column() {
+    let mut module = Module::new().unwrap();
+
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "m".to_string(),
+            ty: ColumnType::Map(Box::new(ColumnType::String), Box::new(ColumnType::Int64)),
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT m FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "MAP<STRING, INT64>");
+}
+
+#[test]
+fn analyzes_a_call_to_a_registered_procedure() {
+    let mut module = Module::new().unwrap();
+
+    // A procedure taking one INT64 argument; CALL with a matching argument
+    // resolves against it.
+    let catalog = Catalog {
+        procedures: vec![ProcedureDef {
+            name: "my_proc".to_string(),
+            arguments: vec![ColumnType::Int64],
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in("CALL my_proc(1)", &catalog);
+    assert!(
+        result.is_ok(),
+        "expected the CALL to resolve, got: {result:?}"
+    );
+}
+
+#[test]
+fn procedure_call_type_checks_its_argument() {
+    let mut module = Module::new().unwrap();
+
+    // The procedure expects INT64; calling it with a STRING fails type checking.
+    let catalog = Catalog {
+        procedures: vec![ProcedureDef {
+            name: "my_proc".to_string(),
+            arguments: vec![ColumnType::Int64],
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in("CALL my_proc('x')", &catalog);
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a type-mismatch error, got: {result:?}"
+    );
+}
+
+#[test]
+fn rejects_a_call_to_an_unknown_procedure() {
+    let mut module = Module::new().unwrap();
+
+    let result = module.analyze_statement_in("CALL missing_proc()", &Catalog::default());
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected an unknown-procedure error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyzes_create_external_table_with_a_registered_connection() {
+    let mut module = Module::new().unwrap();
+
+    // The CREATE EXTERNAL TABLE statement references connection "conn"; with it
+    // registered, the connection resolves and the statement analyzes.
+    let catalog = Catalog {
+        connections: vec!["conn".to_string()],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in(
+        "CREATE EXTERNAL TABLE t WITH CONNECTION conn OPTIONS(uris=['gs://b/f'], format='CSV')",
+        &catalog,
+    );
+    assert!(
+        result.is_ok(),
+        "expected the connection to resolve, got: {result:?}"
+    );
+}
+
+#[test]
+fn rejects_a_reference_to_an_unknown_connection() {
+    let mut module = Module::new().unwrap();
+
+    let result = module.analyze_statement_in(
+        "CREATE EXTERNAL TABLE t WITH CONNECTION conn OPTIONS(uris=['gs://b/f'], format='CSV')",
+        &Catalog::default(),
+    );
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a connection-not-found error, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_a_named_type_in_a_cast() {
+    let mut module = Module::new().unwrap();
+
+    // Register "point" as an alias for STRUCT<x FLOAT64, y FLOAT64>; the name is
+    // then usable as a type, and the CAST resolves to the underlying struct.
+    let catalog = Catalog {
+        types: vec![NamedType {
+            name: "point".to_string(),
+            ty: ColumnType::Struct(vec![
+                StructField {
+                    name: "x".to_string(),
+                    ty: ColumnType::Float64,
+                },
+                StructField {
+                    name: "y".to_string(),
+                    ty: ColumnType::Float64,
+                },
+            ]),
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT CAST(NULL AS point) AS p", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    // FLOAT64 renders as DOUBLE in the resolved type name (internal product mode).
+    assert_eq!(columns[0].type_name(), "STRUCT<x DOUBLE, y DOUBLE>");
+}
+
+#[test]
+fn rejects_a_cast_to_an_unknown_type() {
+    let mut module = Module::new().unwrap();
+
+    let result = module.analyze_statement_in("SELECT CAST(NULL AS my_type)", &Catalog::default());
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a type-not-found error, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_an_enum_type_in_a_cast() {
+    let mut module = Module::new().unwrap();
+
+    // Register "Color" as an enum with two values; the name is then usable as a
+    // type, and a CAST to it resolves.
+    let catalog = Catalog {
+        enums: vec![EnumDef {
+            name: "Color".to_string(),
+            values: vec![
+                EnumValue {
+                    name: "RED".to_string(),
+                    number: 0,
+                },
+                EnumValue {
+                    name: "GREEN".to_string(),
+                    number: 1,
+                },
+            ],
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT CAST(1 AS Color) AS c", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    // An enum type resolves to its catalog name; casting a string literal to it
+    // also resolves (GoogleSQL defers value validation to runtime).
+    assert_eq!(columns[0].type_name(), "Color");
+    assert!(
+        module
+            .analyze_statement_in("SELECT CAST('RED' AS Color)", &catalog)
+            .is_ok()
+    );
+}
+
+#[test]
+fn resolves_multiple_enum_types() {
+    let mut module = Module::new().unwrap();
+
+    // Two enums are built into one shared descriptor pool (each in its own
+    // uniquely named file), and both become usable as types.
+    let catalog = Catalog {
+        enums: vec![
+            EnumDef {
+                name: "Color".to_string(),
+                values: vec![EnumValue {
+                    name: "RED".to_string(),
+                    number: 0,
+                }],
+            },
+            EnumDef {
+                name: "Size".to_string(),
+                values: vec![
+                    EnumValue {
+                        name: "SMALL".to_string(),
+                        number: 0,
+                    },
+                    EnumValue {
+                        name: "LARGE".to_string(),
+                        number: 1,
+                    },
+                ],
+            },
+        ],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in(
+            "SELECT CAST(0 AS Color) AS c, CAST(1 AS Size) AS s",
+            &catalog,
+        )
+        .unwrap();
+
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].type_name(), "Color");
+    assert_eq!(columns[1].type_name(), "Size");
+}
+
+// --- Minimal protobuf wire encoders, just enough to build a FileDescriptorProto
+// for the proto-type tests. A real caller would obtain these bytes from
+// `protoc --descriptor_set_out` or a protobuf library.
+
+fn wire_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = u8::try_from(v & 0x7f).unwrap();
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn wire_len_delimited(buf: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+    wire_varint(buf, u64::from(field) << 3 | 2);
+    wire_varint(buf, u64::try_from(bytes.len()).unwrap());
+    buf.extend_from_slice(bytes);
+}
+
+fn wire_string(buf: &mut Vec<u8>, field: u32, s: &str) {
+    wire_len_delimited(buf, field, s.as_bytes());
+}
+
+fn wire_int32(buf: &mut Vec<u8>, field: u32, v: i32) {
+    wire_varint(buf, u64::from(field) << 3);
+    wire_varint(buf, u64::from(v.unsigned_abs()));
+}
+
+/// Serializes a `FileDescriptorProto` declaring one message:
+/// `message <name> { optional string <field_name> = 1; }`.
+fn person_file_descriptor(name: &str, field_name: &str) -> Vec<u8> {
+    // FieldDescriptorProto: name=1, number=3, label=4 (LABEL_OPTIONAL=1),
+    // type=5 (TYPE_STRING=9).
+    let mut field = Vec::new();
+    wire_string(&mut field, 1, field_name);
+    wire_int32(&mut field, 3, 1);
+    wire_int32(&mut field, 4, 1);
+    wire_int32(&mut field, 5, 9);
+
+    // DescriptorProto: name=1, field=2.
+    let mut message = Vec::new();
+    wire_string(&mut message, 1, name);
+    wire_len_delimited(&mut message, 2, &field);
+
+    // FileDescriptorProto: name=1, message_type=4.
+    let mut file = Vec::new();
+    wire_string(&mut file, 1, "person.proto");
+    wire_len_delimited(&mut file, 4, &message);
+    file
+}
+
+#[test]
+fn resolves_a_proto_typed_column() {
+    let mut module = Module::new().unwrap();
+
+    // The descriptor bytes declare a `Person` message; a column typed as that
+    // proto message resolves against the pool built from `proto_files`.
+    let catalog = Catalog {
+        proto_files: vec![person_file_descriptor("Person", "name")],
+        tables: vec![TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "p".to_string(),
+                ty: ColumnType::Proto("Person".to_string()),
+            }],
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT p FROM t", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "Person");
+}
+
+#[test]
+fn resolves_a_proto_type_inside_an_array() {
+    let mut module = Module::new().unwrap();
+
+    // ColumnType::Proto composes with the other type constructors: an
+    // ARRAY<Person> column builds the proto element type via the pool, then
+    // wraps it, proving proto resolution reaches nested type building.
+    let catalog = Catalog {
+        proto_files: vec![person_file_descriptor("Person", "name")],
+        types: vec![NamedType {
+            name: "people".to_string(),
+            ty: ColumnType::Array(Box::new(ColumnType::Proto("Person".to_string()))),
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in("SELECT CAST(NULL AS people) AS ps", &catalog)
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "ARRAY<Person>");
+}
+
+#[test]
+fn rejects_a_proto_type_without_descriptors() {
+    let mut module = Module::new().unwrap();
+
+    // Referencing a proto type with no `proto_files` registered cannot resolve.
+    let catalog = Catalog {
+        tables: vec![TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "p".to_string(),
+                ty: ColumnType::Proto("Person".to_string()),
+            }],
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in("SELECT p FROM t", &catalog);
+    assert!(
+        result.is_err(),
+        "expected resolution to fail without descriptors, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_a_graph_query_over_a_property_graph() {
+    let mut module = Module::new().unwrap();
+
+    // Register a property graph "people" with a single node table "Person"
+    // backed by an (id, name) input table and exposing a "Person" label with an
+    // "id" and a "name" property. A graph query then resolves against it and a
+    // property access `n.name` types as the property's declared type.
+    let catalog = Catalog {
+        property_graphs: vec![PropertyGraphDef {
+            name: "people".to_string(),
+            node_tables: vec![GraphNodeTableDef {
+                name: "Person".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: ColumnType::Int64,
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: ColumnType::String,
+                    },
+                ],
+                key_columns: vec![0],
+                labels: vec![GraphLabelDef {
+                    name: "Person".to_string(),
+                    properties: vec![
+                        GraphPropertyDef {
+                            name: "id".to_string(),
+                            ty: ColumnType::Int64,
+                            value_sql: "id".to_string(),
+                        },
+                        GraphPropertyDef {
+                            name: "name".to_string(),
+                            ty: ColumnType::String,
+                            value_sql: "name".to_string(),
+                        },
+                    ],
+                }],
+            }],
+            edge_tables: vec![],
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in(
+            "GRAPH people MATCH (n:Person) RETURN n.name AS name",
+            &catalog,
+        )
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "STRING");
+}
+
+#[test]
+fn rejects_a_graph_query_against_an_unknown_label() {
+    let mut module = Module::new().unwrap();
+
+    // The graph exposes only the "Person" label, so a pattern matching a label
+    // that was never registered fails to resolve — proving labels are wired into
+    // the graph rather than accepted unconditionally.
+    let catalog = Catalog {
+        property_graphs: vec![PropertyGraphDef {
+            name: "people".to_string(),
+            node_tables: vec![GraphNodeTableDef {
+                name: "Person".to_string(),
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                    ty: ColumnType::Int64,
+                }],
+                key_columns: vec![0],
+                labels: vec![GraphLabelDef {
+                    name: "Person".to_string(),
+                    properties: vec![GraphPropertyDef {
+                        name: "id".to_string(),
+                        ty: ColumnType::Int64,
+                        value_sql: "id".to_string(),
+                    }],
+                }],
+            }],
+            edge_tables: vec![],
+        }],
+        ..Catalog::default()
+    };
+
+    let result =
+        module.analyze_statement_in("GRAPH people MATCH (n:Unknown) RETURN n.id AS id", &catalog);
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected an unknown-label error, got: {result:?}"
+    );
+}
+
+#[test]
+fn resolves_a_graph_query_over_edges() {
+    let mut module = Module::new().unwrap();
+
+    // A graph with a "Person" node table and a "Knows" edge table connecting one
+    // person to another. A path pattern `(a:Person)-[e:Knows]->(b:Person)` then
+    // resolves, proving the edge table and its source/destination node
+    // references are wired into the graph.
+    let catalog = Catalog {
+        property_graphs: vec![PropertyGraphDef {
+            name: "social".to_string(),
+            node_tables: vec![GraphNodeTableDef {
+                name: "Person".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: ColumnType::Int64,
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: ColumnType::String,
+                    },
+                ],
+                key_columns: vec![0],
+                labels: vec![GraphLabelDef {
+                    name: "Person".to_string(),
+                    properties: vec![GraphPropertyDef {
+                        name: "name".to_string(),
+                        ty: ColumnType::String,
+                        value_sql: "name".to_string(),
+                    }],
+                }],
+            }],
+            edge_tables: vec![GraphEdgeTableDef {
+                name: "Knows".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "from_id".to_string(),
+                        ty: ColumnType::Int64,
+                    },
+                    ColumnDef {
+                        name: "to_id".to_string(),
+                        ty: ColumnType::Int64,
+                    },
+                ],
+                key_columns: vec![0, 1],
+                labels: vec![GraphLabelDef {
+                    name: "Knows".to_string(),
+                    properties: vec![],
+                }],
+                source: GraphNodeReferenceDef {
+                    node_table: "Person".to_string(),
+                    edge_columns: vec![0],
+                    node_columns: vec![0],
+                },
+                destination: GraphNodeReferenceDef {
+                    node_table: "Person".to_string(),
+                    edge_columns: vec![1],
+                    node_columns: vec![0],
+                },
+            }],
+        }],
+        ..Catalog::default()
+    };
+
+    let columns = module
+        .analyze_output_columns_in(
+            "GRAPH social MATCH (a:Person)-[e:Knows]->(b:Person) RETURN a.name AS name",
+            &catalog,
+        )
+        .unwrap();
+
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].type_name(), "STRING");
+}
+
+#[test]
+fn rejects_an_edge_referencing_an_unknown_node_table() {
+    let mut module = Module::new().unwrap();
+
+    // The edge's source references a node table "Ghost" that the graph never
+    // declares, so building the graph fails before analysis.
+    let catalog = Catalog {
+        property_graphs: vec![PropertyGraphDef {
+            name: "social".to_string(),
+            node_tables: vec![GraphNodeTableDef {
+                name: "Person".to_string(),
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                    ty: ColumnType::Int64,
+                }],
+                key_columns: vec![0],
+                labels: vec![GraphLabelDef {
+                    name: "Person".to_string(),
+                    properties: vec![],
+                }],
+            }],
+            edge_tables: vec![GraphEdgeTableDef {
+                name: "Knows".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "from_id".to_string(),
+                        ty: ColumnType::Int64,
+                    },
+                    ColumnDef {
+                        name: "to_id".to_string(),
+                        ty: ColumnType::Int64,
+                    },
+                ],
+                key_columns: vec![0, 1],
+                labels: vec![GraphLabelDef {
+                    name: "Knows".to_string(),
+                    properties: vec![],
+                }],
+                source: GraphNodeReferenceDef {
+                    node_table: "Ghost".to_string(),
+                    edge_columns: vec![0],
+                    node_columns: vec![0],
+                },
+                destination: GraphNodeReferenceDef {
+                    node_table: "Person".to_string(),
+                    edge_columns: vec![1],
+                    node_columns: vec![0],
+                },
+            }],
+        }],
+        ..Catalog::default()
+    };
+
+    let result = module.analyze_statement_in(
+        "GRAPH social MATCH (a:Person)-[e:Knows]->(b:Person) RETURN 1 AS x",
+        &catalog,
+    );
+    assert!(
+        matches!(result, Err(Error::Protocol(_))),
+        "expected an unknown-node-table error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_expression_returns_the_inferred_scalar_type() {
+    let mut module = Module::new().unwrap();
+
+    // `1 + 1` resolves via the builtin `$add`, so the expression's inferred
+    // type is INT64.
+    let type_name = module.analyze_expression("1 + 1", &[]).unwrap();
+
+    assert_eq!(type_name, "INT64");
+}
+
+#[test]
+fn analyze_expression_types_a_function_call() {
+    let mut module = Module::new().unwrap();
+
+    // CONCAT over string literals resolves to STRING.
+    let type_name = module.analyze_expression("CONCAT('a', 'b')", &[]).unwrap();
+
+    assert_eq!(type_name, "STRING");
+}
+
+#[test]
+fn analyze_expression_types_a_comparison_as_bool() {
+    let mut module = Module::new().unwrap();
+
+    let type_name = module.analyze_expression("1 = 2", &[]).unwrap();
+
+    assert_eq!(type_name, "BOOL");
+}
+
+#[test]
+fn analyze_expression_errors_on_unresolved_name() {
+    let mut module = Module::new().unwrap();
+
+    // `foo` is neither a catalog constant nor an in-scope column, so name
+    // resolution fails instead of silently producing a type.
+    let result = module.analyze_expression("foo + 1", &[]);
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_expression_in_resolves_a_catalog_constant() {
+    let mut module = Module::new().unwrap();
+
+    // A named constant of type INT64; referencing it in an expression yields a
+    // type derived from the constant.
+    let catalog = Catalog {
+        constants: vec![ConstantDef {
+            name: "my_const".to_string(),
+            value: ConstantValue::Int64(42),
+        }],
+        ..Catalog::default()
+    };
+
+    let type_name = module
+        .analyze_expression_in("my_const * 2", &catalog)
+        .unwrap();
+
+    assert_eq!(type_name, "INT64");
+}
+
+#[test]
+fn analyze_expression_with_columns_resolves_a_column_reference() {
+    let mut module = Module::new().unwrap();
+
+    // `a` and `b` are in-scope expression columns, so `a + b` resolves to the
+    // combined INT64 type even though there is no table.
+    let columns = vec![
+        ColumnDef {
+            name: "a".to_string(),
+            ty: ColumnType::Int64,
+        },
+        ColumnDef {
+            name: "b".to_string(),
+            ty: ColumnType::Int64,
+        },
+    ];
+
+    let type_name = module
+        .analyze_expression_with_columns("a + b", &columns)
+        .unwrap();
+
+    assert_eq!(type_name, "INT64");
+}
+
+#[test]
+fn analyze_expression_with_columns_passes_the_column_type_through() {
+    let mut module = Module::new().unwrap();
+
+    // A STRING column fed through UPPER resolves to STRING, confirming the
+    // declared column type reaches the analyzer.
+    let columns = vec![ColumnDef {
+        name: "name".to_string(),
+        ty: ColumnType::String,
+    }];
+
+    let type_name = module
+        .analyze_expression_with_columns("UPPER(name)", &columns)
+        .unwrap();
+
+    assert_eq!(type_name, "STRING");
+}
+
+#[test]
+fn analyze_expression_with_columns_errors_on_an_undeclared_column() {
+    let mut module = Module::new().unwrap();
+
+    // Only `a` is in scope; referencing `b` fails name resolution instead of
+    // silently producing a type.
+    let columns = vec![ColumnDef {
+        name: "a".to_string(),
+        ty: ColumnType::Int64,
+    }];
+
+    let result = module.analyze_expression_with_columns("a + b", &columns);
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_expression_in_resolves_a_catalog_expression_column() {
+    let mut module = Module::new().unwrap();
+
+    // Expression columns declared on the catalog are in scope alongside its
+    // constants and functions, so `qty * 2` resolves against the INT64 column.
+    let catalog = Catalog {
+        expression_columns: vec![ColumnDef {
+            name: "qty".to_string(),
+            ty: ColumnType::Int64,
+        }],
+        ..Catalog::default()
+    };
+
+    let type_name = module.analyze_expression_in("qty * 2", &catalog).unwrap();
+
+    assert_eq!(type_name, "INT64");
+}
+
+#[test]
+fn analyze_type_resolves_a_builtin_scalar_type() {
+    let mut module = Module::new().unwrap();
+
+    let type_name = module.analyze_type("INT64", &[]).unwrap();
+
+    assert_eq!(type_name, "INT64");
+}
+
+#[test]
+fn analyze_type_resolves_a_structural_type() {
+    let mut module = Module::new().unwrap();
+
+    // ARRAY and STRUCT type names round-trip through the resolved type's name.
+    assert_eq!(
+        module.analyze_type("ARRAY<STRING>", &[]).unwrap(),
+        "ARRAY<STRING>"
+    );
+    assert_eq!(
+        module
+            .analyze_type("STRUCT<a INT64, b STRING>", &[])
+            .unwrap(),
+        "STRUCT<a INT64, b STRING>"
+    );
+}
+
+#[test]
+fn analyze_type_errors_on_unknown_type() {
+    let mut module = Module::new().unwrap();
+
+    // `nosuchtype` is not a builtin nor catalog-defined type name.
+    let result = module.analyze_type("nosuchtype", &[]);
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_type_in_resolves_a_catalog_named_type() {
+    let mut module = Module::new().unwrap();
+
+    // "point" is a catalog alias for a struct; resolving the name yields the
+    // underlying type (FLOAT64 renders as DOUBLE in internal product mode).
+    let catalog = Catalog {
+        types: vec![NamedType {
+            name: "point".to_string(),
+            ty: ColumnType::Struct(vec![
+                StructField {
+                    name: "x".to_string(),
+                    ty: ColumnType::Float64,
+                },
+                StructField {
+                    name: "y".to_string(),
+                    ty: ColumnType::Float64,
+                },
+            ]),
+        }],
+        ..Catalog::default()
+    };
+
+    let type_name = module.analyze_type_in("point", &catalog).unwrap();
+
+    assert_eq!(type_name, "STRUCT<x DOUBLE, y DOUBLE>");
+}
+
+#[test]
+fn product_mode_defaults_to_internal_type_names() {
+    let mut module = Module::new().unwrap();
+
+    // Internal (the default) renders the 64-bit float type as DOUBLE.
+    assert_eq!(module.analyze_type("FLOAT64", &[]).unwrap(), "DOUBLE");
+}
+
+#[test]
+fn external_product_mode_renders_bigquery_type_names() {
+    let mut module = Module::new().unwrap();
+    module.set_product_mode(ProductMode::External);
+
+    // External (BigQuery) mode renders the same type as FLOAT64.
+    assert_eq!(module.analyze_type("FLOAT64", &[]).unwrap(), "FLOAT64");
+    assert_eq!(
+        module.analyze_type("STRUCT<x FLOAT64>", &[]).unwrap(),
+        "STRUCT<x FLOAT64>"
+    );
+}
+
+#[test]
+fn product_mode_affects_resolved_output_column_type_names() {
+    let mut module = Module::new().unwrap();
+    module.set_product_mode(ProductMode::External);
+
+    let table = TableDef {
+        name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "c".to_string(),
+            ty: ColumnType::Float64,
+        }],
+    };
+
+    let columns = module
+        .analyze_output_columns("SELECT c FROM t", &[table])
+        .unwrap();
+
+    assert_eq!(columns[0].type_name(), "FLOAT64");
+}
+
+#[test]
+fn product_mode_can_be_switched_back_to_internal() {
+    let mut module = Module::new().unwrap();
+
+    module.set_product_mode(ProductMode::External);
+    assert_eq!(module.analyze_type("FLOAT64", &[]).unwrap(), "FLOAT64");
+
+    module.set_product_mode(ProductMode::Internal);
+    assert_eq!(module.analyze_type("FLOAT64", &[]).unwrap(), "DOUBLE");
+}
+
+#[test]
+fn analyze_statements_counts_every_statement_in_a_script() {
+    let mut module = Module::new().unwrap();
+
+    // Three semicolon-separated statements are each analyzed in turn.
+    let count = module
+        .analyze_statements("SELECT 1; SELECT 2; SELECT 3", &[])
+        .unwrap();
+
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn analyze_statements_accepts_a_single_statement_without_a_trailing_semicolon() {
+    let mut module = Module::new().unwrap();
+
+    let count = module.analyze_statements("SELECT 1", &[]).unwrap();
+
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn analyze_statements_ignores_a_trailing_semicolon_and_whitespace() {
+    let mut module = Module::new().unwrap();
+
+    // A final semicolon and trailing whitespace do not count as another
+    // statement.
+    let count = module.analyze_statements("SELECT 1;\n  ", &[]).unwrap();
+
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn analyze_statements_ignores_a_trailing_comment() {
+    let mut module = Module::new().unwrap();
+
+    // A comment after the last statement is not a further statement: the
+    // analyzer skips it and reports end of input.
+    assert_eq!(
+        module
+            .analyze_statements("SELECT 1; -- trailing", &[])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        module
+            .analyze_statements("SELECT 1; /* block */", &[])
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn analyze_statements_reports_zero_for_an_empty_script() {
+    let mut module = Module::new().unwrap();
+
+    assert_eq!(module.analyze_statements("", &[]).unwrap(), 0);
+    assert_eq!(module.analyze_statements("   \n ", &[]).unwrap(), 0);
+}
+
+#[test]
+fn analyze_statements_fails_on_the_first_invalid_statement() {
+    let mut module = Module::new().unwrap();
+
+    // The second statement references an unknown name, so analysis of the
+    // script fails.
+    let result = module.analyze_statements("SELECT 1; SELECT missing_name", &[]);
+
+    assert!(
+        matches!(result, Err(Error::GoogleSql(_))),
+        "expected a GoogleSql error, got: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_statements_resolves_each_statement_against_the_catalog() {
+    let mut module = Module::new().unwrap();
+
+    let users = TableDef {
+        name: "users".to_string(),
+        columns: vec![ColumnDef {
+            name: "id".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // Both statements reference the registered table.
+    let count = module
+        .analyze_statements("SELECT id FROM users; SELECT COUNT(*) FROM users", &[users])
+        .unwrap();
+
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn undeclared_parameter_types_infers_a_positional_parameter() {
+    let mut module = Module::new().unwrap();
+
+    // `?` added to an INT64 literal must itself resolve to INT64.
+    let types = module
+        .undeclared_parameter_types("SELECT ? + 1", &[])
+        .unwrap();
+
+    assert_eq!(types, vec!["INT64"]);
+}
+
+#[test]
+fn undeclared_parameter_types_reports_each_parameter_in_order() {
+    let mut module = Module::new().unwrap();
+
+    // Two positional parameters, both used where a STRING is expected.
+    let types = module
+        .undeclared_parameter_types("SELECT CONCAT(?, ?)", &[])
+        .unwrap();
+
+    assert_eq!(types, vec!["STRING", "STRING"]);
+}
+
+#[test]
+fn undeclared_parameter_types_is_empty_without_parameters() {
+    let mut module = Module::new().unwrap();
+
+    assert!(
+        module
+            .undeclared_parameter_types("SELECT 1", &[])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn undeclared_parameter_types_resolves_against_the_catalog() {
+    let mut module = Module::new().unwrap();
+
+    let users = TableDef {
+        name: "users".to_string(),
+        columns: vec![ColumnDef {
+            name: "id".to_string(),
+            ty: ColumnType::Int64,
+        }],
+    };
+
+    // The parameter is compared against an INT64 column, so it infers INT64.
+    let types = module
+        .undeclared_parameter_types("SELECT id FROM users WHERE id = ?", &[users])
+        .unwrap();
+
+    assert_eq!(types, vec!["INT64"]);
+}
