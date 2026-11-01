@@ -58,6 +58,13 @@ wasmtime = [
     "dep:wasmtime",
     "dep:wasmtime-wasi",
 ]
+# Hermetic analysis: bundle the IANA tz database into the wasmtime backend
+# instead of reading the host's /usr/share/zoneinfo, so every host resolves
+# zones against the same tz data regardless of local zoneinfo modifications.
+# Windows always bundles (see the cfg(windows) dependency above); unix hosts
+# default to their own (possibly locally modified) system database and opt
+# into the hermetic one with this feature.
+bundled-tzdb = ["dep:tzdb"]
 
 [lib]
 name = "googlesql"
@@ -162,6 +169,19 @@ optional = true
 [dependencies.wasmtime-wasi]
 version = "47"
 optional = true
+
+# Bundled IANA tz database for the wasmtime backend's analyzer: the materialized
+# zones are preopened at the guest path /usr/share/zoneinfo so cctz resolves
+# named zones without a host database. Optional here (unix opt-in via the
+# `bundled-tzdb` feature); unconditional on Windows via the target table below.
+[dependencies.tzdb]
+version = "0.7"
+optional = true
+
+[target.'cfg(windows)'.dependencies.tzdb]
+# Windows always bundles: the host has no /usr/share/zoneinfo at all, and its
+# absence made every analyze call trap (cctz aborts with wasm `unreachable`).
+version = "0.7"
 
 [dev-dependencies.criterion]
 version = "0.8"
