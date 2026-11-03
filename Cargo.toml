@@ -54,17 +54,21 @@ features = [
 default = ["native-ffi"]
 native = []
 native-ffi = []
+# `dep:tzdb` rides with the engine: every windows wasmtime build needs the
+# bundled database, while a unix one compiles it unreferenced (host database
+# stays the source of truth) unless the hermetic arm below opts in.
 wasmtime = [
     "dep:wasmtime",
     "dep:wasmtime-wasi",
+    "dep:tzdb",
 ]
 # Hermetic analysis: bundle the IANA tz database into the wasmtime backend
 # instead of reading the host's /usr/share/zoneinfo, so every host resolves
 # zones against the same tz data regardless of local zoneinfo modifications.
-# Windows always bundles (see the cfg(windows) dependency above); unix hosts
-# default to their own (possibly locally modified) system database and opt
-# into the hermetic one with this feature.
-bundled-tzdb = ["dep:tzdb"]
+# On unix this is the opt-in and pulls `libc` for the per-user cache root;
+# the `tzdb` crate itself is already activated by `wasmtime`, so this only
+# marks the hermetic arm.
+bundled-tzdb = ["dep:tzdb", "dep:libc"]
 
 [lib]
 name = "googlesql"
@@ -170,18 +174,34 @@ optional = true
 version = "47"
 optional = true
 
-# Bundled IANA tz database for the wasmtime backend's analyzer: the materialized
+# Optional IANA tz database for the wasmtime backend's analyzer: the materialized
 # zones are preopened at the guest path /usr/share/zoneinfo so cctz resolves
-# named zones without a host database. Optional here (unix opt-in via the
-# `bundled-tzdb` feature); unconditional on Windows via the target table below.
+# named zones without a host database. Activated by the `wasmtime` feature:
+# every windows wasmtime build needs it (the host has no /usr/share/zoneinfo,
+# and its absence made every analyze call trap), while the default `native-ffi`
+# build never compiles or links tz data it cannot use. Platform-scoping the
+# activation tighter than that is not expressible — a `dep:` reference in a
+# feature is not target-filtered, and declaring the crate under per-platform
+# names makes cargo reject any build activating both ("multiple times with
+# different names") — so a unix plain-wasmtime build compiles this crate
+# without referencing it: its analyzer keeps using the host database unless
+# `bundled-tzdb` opts into the hermetic one, only that arm reads `tzdb::`.
+# `default-features = false`: tzdb's defaults pull `local` (-> `iana-time-zone`
+# -> `windows-core`, `js-sys`, ...), and none of the APIs used here (VERSION,
+# TZ_NAMES, raw_tz_by_name) is feature-gated.
 [dependencies.tzdb]
 version = "0.7"
 optional = true
+default-features = false
 
-[target.'cfg(windows)'.dependencies.tzdb]
-# Windows always bundles: the host has no /usr/share/zoneinfo at all, and its
-# absence made every analyze call trap (cctz aborts with wasm `unreachable`).
-version = "0.7"
+# `getuid` for the per-user tzdb cache root and its ownership check (see
+# `tzdb_cache_root` / `dir_is_private` in src/wasmtime_backend.rs): unix `/tmp`
+# is shared and world-writable, so the cache must be verifiably ours. Only
+# activated by `bundled-tzdb`, keeping the unix default tree free of it.
+[target.'cfg(unix)'.dependencies.libc]
+version = "0.2"
+optional = true
+default-features = false
 
 [dev-dependencies.criterion]
 version = "0.8"
