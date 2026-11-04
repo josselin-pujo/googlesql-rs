@@ -13,9 +13,7 @@
 //! only on the engine-agnostic [`GuestInstance`] trait.
 
 use std::collections::HashMap;
-use std::path::Path;
-#[cfg(any(windows, feature = "bundled-tzdb"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use wasmtime::{
@@ -33,6 +31,50 @@ const WASM_PATH: &str = env!("GOOGLESQL_WASM_PATH");
 
 /// Absolute path to the precompiled `googlesql.cwasm` prepared by build.rs.
 const CWASM_PATH: &str = env!("GOOGLESQL_CWASM_PATH");
+
+/// The zstd-compressed wasm, embedded so a copied executable analyzes
+/// without the build tree: the build-time `.cwasm` lives in `OUT_DIR`, which
+/// ships with neither the executable nor its users. The compressed module
+/// (a few MB) rides inside the binary instead of the ~53MB precompiled
+/// cwasm; the runtime JIT-compiles once and caches the serialized module
+/// under the per-user temp cache root, keyed by the wasm SHA — so the JIT
+/// price is paid once per user, not per run.
+static EMBEDDED_WASM_ZSTD: &[u8] = include_bytes!(env!("GOOGLESQL_WASM_ZSTD_PATH"));
+
+/// SHA256 of the verified wasm (pinned in build.rs), keying the cwasm cache.
+const WASM_SHA256: &str = env!("GOOGLESQL_WASM_SHA256");
+
+/// Root of the on-disk cwasm cache, mirroring `tzdb_cache_root` (plain text:
+/// that function is not compiled for every build this one is): unix `/tmp`
+/// is shared and world-writable, and a cached `.cwasm` is *executed* once
+/// deserialized — a planted cache would be code execution, not just wrong
+/// data — so the per-UID suffix plus the ownership check in [`dir_is_private`]
+/// keep the cache ours alone. Windows `%TEMP%` is per-user, needing no suffix.
+fn cwasm_cache_dir() -> PathBuf {
+    #[cfg(unix)]
+    let user = {
+        #[allow(
+            unsafe_code,
+            reason = "getuid is a pure libc query with no preconditions; std exposes no uid API"
+        )]
+        let uid = unsafe { libc::getuid() };
+        format!("-{uid}")
+    };
+    // Windows needs no suffix: `%TEMP%` is per-user already.
+    #[cfg(windows)]
+    let user = String::new();
+    std::env::temp_dir().join(format!("googlesql-engine{user}"))
+}
+
+/// Path of this wasm's cached serialized module.
+fn cwasm_cache_path() -> PathBuf {
+    // `get` over slicing: char-boundary safety is unprovable at this spot, and
+    // the full SHA is an equally unique key should the pin ever be shorter.
+    cwasm_cache_dir().join(format!(
+        "{}.cwasm",
+        WASM_SHA256.get(..16).unwrap_or(WASM_SHA256)
+    ))
+}
 
 /// Process-wide cache of the compiled wasm module and its `Engine`.
 ///
@@ -67,22 +109,110 @@ fn shared_wasm() -> Result<&'static (Engine, WasmModule), Error> {
         .map_err(|e| Error::Instantiate(e.clone()))
 }
 
-/// Deserializes the precompiled `.cwasm`, falling back to JIT-compiling the wasm.
+/// Deserializes the precompiled `.cwasm` — the build-tree artifact in dev
+/// builds, else this user's temp cache from a previous run — falling back
+/// to JIT-compiling the wasm (build-tree file, else the embedded compressed
+/// copy, which also (re)populates the temp cache for the next run).
 fn load_module(engine: &Engine) -> Result<WasmModule, String> {
-    // SAFETY: CWASM_PATH is produced by our own build.rs from the SHA-pinned
-    // wasm using the identical `Engine::default()` configuration, so the bytes
-    // are a trusted, format-compatible artifact. A mismatch is caught by
-    // `deserialize_file` returning `Err` (not undefined behavior), which we
-    // handle by falling back to JIT below.
+    // SAFETY: the build-tree artifact is produced by our own build.rs from
+    // the SHA-pinned wasm with the identical `Engine::default()`. A mismatch —
+    // a stale artifact from a different wasmtime build or CPU — is caught by
+    // deserialization returning `Err` (not undefined behavior), handled by
+    // the fallbacks below.
     #[expect(
         unsafe_code,
         reason = "deserializing a trusted build-time artifact produced by our own build.rs"
     )]
     let deserialized = unsafe { WasmModule::deserialize_file(engine, CWASM_PATH) };
-    deserialized.or_else(|_| {
-        WasmModule::from_file(engine, WASM_PATH)
-            .map_err(|e| format!("load {WASM_PATH} (after .cwasm deserialize failed): {e}"))
-    })
+    if let Ok(module) = deserialized {
+        return Ok(module);
+    }
+    if let Some(module) = cached_cwasm(engine) {
+        return Ok(module);
+    }
+    WasmModule::from_file(engine, WASM_PATH).or_else(|_| jit_from_embedded(engine))
+}
+
+/// Deserializes this wasm's module from the temp cwasm cache — but only once
+/// that cache is verifiably ours alone (see [`cwasm_cache_dir`]; the check is
+/// what makes the `deserialize` below sound). A missing cache, a directory we
+/// do not own, or an artifact a different wasmtime build left behind all
+/// return `None`, and the caller JIT-compiles from the embedded copy instead.
+fn cached_cwasm(engine: &Engine) -> Option<WasmModule> {
+    if !dir_is_private(&cwasm_cache_dir()) {
+        return None;
+    }
+    // SAFETY: the cache root is owned by this user and closed to group/world
+    // writes ([`dir_is_private`]), so only a build of ours could have placed
+    // the artifact; one from a different engine is rejected with `Err`, which
+    // surfaces as `None` here and a JIT fallback for the caller.
+    #[expect(
+        unsafe_code,
+        reason = "deserializing an artifact from a cache root verified ours alone"
+    )]
+    let cached = unsafe { WasmModule::deserialize_file(engine, cwasm_cache_path()) };
+    cached.ok()
+}
+
+/// JIT-compiles the decompressed embedded wasm, best-effort populating the
+/// temp cwasm cache via `precompile_module` so later runs deserialize instead.
+fn jit_from_embedded(engine: &Engine) -> Result<WasmModule, String> {
+    let wasm = zstd::stream::decode_all(EMBEDDED_WASM_ZSTD)
+        .map_err(|e| format!("zstd-decode embedded googlesql.wasm: {e}"))?;
+
+    // Serialize for the cache, then deserialize our own trusted output — one
+    // compile serves both this run and the next.
+    let serialized = engine.precompile_module(&wasm).map_err(|e| {
+        format!("precompile embedded googlesql.wasm (build-tree {WASM_PATH} absent): {e}")
+    })?;
+    write_cwasm_cache(&serialized);
+
+    // SAFETY: produced by this process's own `precompile_module` from the
+    // SHA-pinned wasm seconds ago.
+    #[expect(
+        unsafe_code,
+        reason = "deserializing an artifact this process just produced via precompile_module"
+    )]
+    unsafe { WasmModule::deserialize(engine, &serialized) }
+        .map_err(|e| format!("deserialize freshly precompiled module: {e}"))
+}
+
+/// Best-effort atomic cache write — a `.tmp-<pid>` staging file renamed into
+/// place — never fatal: correctness never depends on the cache, only speed.
+///
+/// Skipped unless the cache root is verifiably ours ([`cwasm_cache_dir`]):
+/// the read side demands the same, and a cache nobody may read is not worth
+/// writing. The pid suffix keeps concurrent processes from truncating each
+/// other's staging file (a fixed name would have two writers share one);
+/// a rename loser simply keeps the winner's artifact, which the SHA key
+/// makes equivalent.
+fn write_cwasm_cache(serialized: &[u8]) {
+    let dir = cwasm_cache_dir();
+    if create_cache_dirs(&dir).is_err() || !dir_is_private(&dir) {
+        return;
+    }
+    let final_path = cwasm_cache_path();
+    let tmp_path = final_path.with_extension(format!("cwasm.tmp-{}", std::process::id()));
+    // A leftover staging file from an earlier run of this pid (or a recycled
+    // pid) would make the `create_new` write below fail; clear it first.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "best-effort cleanup; a real failure surfaces at the write below"
+    )]
+    let _ = std::fs::remove_file(&tmp_path);
+    if write_cache_file(&tmp_path, serialized).is_err() {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "best-effort cleanup; the cache is repopulated on a later run"
+        )]
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "lost a race with a concurrent writer; its artifact is equivalent"
+    )]
+    let _ = std::fs::rename(&tmp_path, &final_path);
 }
 
 /// Guest path at which the tz database is exposed inside the sandbox.
@@ -175,8 +305,8 @@ fn tzdb_cache_root() -> PathBuf {
 /// truncates files under readers on every rebuild.
 ///
 /// Every directory is created without group/world write permission (see
-/// [`create_tz_dirs`]) and every file with explicit `0644` (see
-/// [`write_tzdb_file`]), so even a permissive umask cannot leave the cache
+/// [`create_cache_dirs`]) and every file with explicit `0644` (see
+/// [`write_cache_file`]), so even a permissive umask cannot leave the cache
 /// modifiable by others.
 #[cfg(any(windows, feature = "bundled-tzdb"))]
 fn write_bundled_tzdb(root: &Path) -> Result<PathBuf, String> {
@@ -188,7 +318,7 @@ fn write_bundled_tzdb(root: &Path) -> Result<PathBuf, String> {
     // written into it: unix `/tmp` is world-writable and another user could
     // have pre-created this predictable path (windows `%TEMP%` is per-user,
     // where [`dir_is_private`] always passes).
-    create_tz_dirs(root).map_err(|error| {
+    create_cache_dirs(root).map_err(|error| {
         format!(
             "materialize the bundled tz database: create {}: {error}",
             root.display()
@@ -205,7 +335,7 @@ fn write_bundled_tzdb(root: &Path) -> Result<PathBuf, String> {
     // this pid (or a recycled pid) would make the write below incomplete.
     let staged = root.join(format!("{}.tmp-{}", tzdb::VERSION, std::process::id()));
     remove_dir_best_effort(&staged);
-    create_tz_dirs(&staged).map_err(|error| {
+    create_cache_dirs(&staged).map_err(|error| {
         format!(
             "materialize the bundled tz database: create {}: {error}",
             staged.display()
@@ -213,7 +343,7 @@ fn write_bundled_tzdb(root: &Path) -> Result<PathBuf, String> {
     })?;
     for &name in tzdb::TZ_NAMES {
         let zone = staged.join(name);
-        create_tz_dirs(zone.parent().unwrap_or(&staged)).map_err(|error| {
+        create_cache_dirs(zone.parent().unwrap_or(&staged)).map_err(|error| {
             format!(
                 "materialize the bundled tz database: create {}: {error}",
                 zone.display()
@@ -222,14 +352,14 @@ fn write_bundled_tzdb(root: &Path) -> Result<PathBuf, String> {
         let bytes = tzdb::raw_tz_by_name(name).ok_or_else(|| {
             format!("materialize the bundled tz database: zone {name} missing from bundled data")
         })?;
-        write_tzdb_file(&zone, bytes).map_err(|error| {
+        write_cache_file(&zone, bytes).map_err(|error| {
             format!(
                 "materialize the bundled tz database: write {}: {error}",
                 zone.display()
             )
         })?;
     }
-    write_tzdb_file(&staged.join(TZDB_MARKER), tzdb::VERSION.as_bytes()).map_err(|error| {
+    write_cache_file(&staged.join(TZDB_MARKER), tzdb::VERSION.as_bytes()).map_err(|error| {
         format!(
             "materialize the bundled tz database: write {}/{TZDB_MARKER}: {error}",
             staged.display()
@@ -280,9 +410,11 @@ fn tzdb_dir_complete(dir: &Path) -> bool {
 /// Only meaningful where the temp directory is shared: unix `/tmp`. Windows
 /// `%TEMP%` is per-user and access-controlled by the OS, so everything
 /// reachable there is trusted outright.
-// Compiled only under `bundled-tzdb` (matching its callers): plain unix
-// wasmtime builds never materialize a cache and do not pull `libc`.
-#[cfg(all(unix, feature = "bundled-tzdb"))]
+//
+// Compiled for any unix wasmtime build: both caches materialized under the
+// temp directory — the tzdb cache (`bundled-tzdb`) and the cwasm cache (every
+// wasmtime build) — trust only a directory that is verifiably ours.
+#[cfg(all(unix, feature = "wasmtime"))]
 fn dir_is_private(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(dir).is_ok_and(|meta| {
@@ -321,13 +453,15 @@ fn remove_dir_best_effort(dir: &Path) {
 /// Unix directory creation applies the umask to `0777`, so a permissive umask
 /// (e.g. 000 in some containers) would leave the cache group/world-writable —
 /// both failing our own trust check on the next run and letting others rewrite
-/// zones. `mode(0o755)` is still umask-masked, but since `0o755` carries no
-/// group/world-write bits, the umask can only tighten it, never loosen it.
+/// its contents. `mode(0o755)` is still umask-masked, but since `0o755` carries
+/// no group/world-write bits, the umask can only tighten it, never loosen it.
 /// Windows needs nothing beyond `create_dir_all`: `%TEMP%` is per-user and
 /// ACL-controlled.
-// Compiled only under `bundled-tzdb`, matching its callers (see `dir_is_private`).
-#[cfg(all(unix, feature = "bundled-tzdb"))]
-fn create_tz_dirs(dir: &Path) -> std::io::Result<()> {
+//
+// Compiled for any unix wasmtime build (see `dir_is_private`): the tzdb and
+// cwasm caches share this.
+#[cfg(all(unix, feature = "wasmtime"))]
+fn create_cache_dirs(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .mode(0o755)
@@ -335,23 +469,24 @@ fn create_tz_dirs(dir: &Path) -> std::io::Result<()> {
         .create(dir)
 }
 
-/// Windows twin of [`create_tz_dirs`].
+/// Windows twin of [`create_cache_dirs`].
 #[cfg(windows)]
-fn create_tz_dirs(dir: &Path) -> std::io::Result<()> {
+fn create_cache_dirs(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Writes one file of the tz database (a zone, or the marker) with explicit
-/// `0644` permissions.
+/// Writes one cache file (a tz zone, the tzdb marker, a staged cwasm) with
+/// explicit `0644` permissions.
 ///
 /// Unix `fs::write` creates files as `0666 & !umask`, so a permissive umask
-/// (e.g. 000 in some containers) would leave the zones rewritable by other
-/// users even inside `0755` directories. `create_new` never truncates an
-/// existing file, and like [`create_tz_dirs`] the mode is umask-masked but
-/// `0o644` carries no group/world-write bits, so the umask can only tighten
-/// it. Compiled only under `bundled-tzdb`, matching its callers.
-#[cfg(all(unix, feature = "bundled-tzdb"))]
-fn write_tzdb_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// (e.g. 000 in some containers) would leave the file rewritable by other
+/// users even inside `0755` directories — for the cwasm cache that is
+/// in-place modification of *executed* bytes. `create_new` never truncates
+/// an existing file, and like [`create_cache_dirs`] the mode is umask-masked
+/// but `0o644` carries no group/world-write bits, so the umask can only
+/// tighten it.
+#[cfg(all(unix, feature = "wasmtime"))]
+fn write_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -362,10 +497,10 @@ fn write_tzdb_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
-/// Windows twin of [`write_tzdb_file`]: `%TEMP%` is per-user and
+/// Windows twin of [`write_cache_file`]: `%TEMP%` is per-user and
 /// ACL-controlled, so plain `fs::write` needs no pinned mode.
 #[cfg(windows)]
-fn write_tzdb_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 

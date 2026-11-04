@@ -60,7 +60,9 @@ native-ffi = []
 wasmtime = [
     "dep:wasmtime",
     "dep:wasmtime-wasi",
+    "dep:zstd",
     "dep:tzdb",
+    "dep:libc",
 ]
 # Hermetic analysis: bundle the IANA tz database into the wasmtime backend
 # instead of reading the host's /usr/share/zoneinfo, so every host resolves
@@ -174,6 +176,14 @@ optional = true
 version = "47"
 optional = true
 
+# zstd decoder for the embedded, compressed googlesql.wasm (copied-executable
+# installs; see wasmtime_backend's load_module). Decoder only — the compressed
+# artifact itself is produced by build.rs.
+[dependencies.zstd]
+version = "0.13"
+optional = true
+default-features = false
+
 # Optional IANA tz database for the wasmtime backend's analyzer: the materialized
 # zones are preopened at the guest path /usr/share/zoneinfo so cctz resolves
 # named zones without a host database. Activated by the `wasmtime` feature:
@@ -194,10 +204,14 @@ version = "0.7"
 optional = true
 default-features = false
 
-# `getuid` for the per-user tzdb cache root and its ownership check (see
-# `tzdb_cache_root` / `dir_is_private` in src/wasmtime_backend.rs): unix `/tmp`
-# is shared and world-writable, so the cache must be verifiably ours. Only
-# activated by `bundled-tzdb`, keeping the unix default tree free of it.
+# `getuid` for the per-user temp cache roots and their ownership checks (see
+# `tzdb_cache_root` / `cwasm_cache_dir` / `dir_is_private` in
+# src/wasmtime_backend.rs): unix `/tmp` is shared and world-writable, so any
+# cache there must be verifiably ours — the tzdb cache under `bundled-tzdb`,
+# and the cwasm cache every wasmtime build may deserialize. `dep:libc` is
+# target-gated to unix, so the feature reference is a no-op elsewhere; on
+# unix wasmtime builds libc is linked transitively (rustix) anyway, and the
+# direct activation only adds the declaration.
 [target.'cfg(unix)'.dependencies.libc]
 version = "0.2"
 optional = true

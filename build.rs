@@ -84,23 +84,50 @@ fn prepare_wasm() -> Result<(), Box<dyn Error>> {
     let cwasm_dest = out_dir.join("googlesql.cwasm");
 
     // docs.rs builds run offline and only generate documentation — they never
-    // execute the crate, and the wasm is loaded lazily at runtime (not embedded
-    // at compile time). Skip fetching it there so the build doesn't fail on the
-    // network; only the env vars below need to be set for compilation.
+    // execute the crate, and the wasm is loaded lazily at runtime (the path
+    // constants below are read via `env!`, which needs no file). The embedded
+    // compressed copy is different: `include_bytes!` reads it at compile time,
+    // so a trivially valid zstd stream over an empty payload stands in for the
+    // unfetchable wasm there. Skip the fetch and the precompile either way so
+    // the build doesn't fail on the network.
+    let zstd_dest = out_dir.join("googlesql.wasm.zst");
     if env::var_os("DOCS_RS").is_none() {
         let bytes = resolve_wasm_bytes(&dest)?;
         verify_sha256(&bytes)?;
         fs::write(&dest, &bytes)?;
         precompile_cwasm(&bytes, &cwasm_dest)?;
+        compress_wasm(&bytes, &zstd_dest)?;
+    } else {
+        compress_wasm(&[], &zstd_dest)?;
     }
 
     // Expose the absolute paths to the wasm and its precompiled artifact for use
-    // at runtime.
+    // at runtime, plus the compressed copy and the wasm SHA that keys the
+    // runtime's on-disk cwasm cache (copied-executable installs).
     println!("cargo::rustc-env=GOOGLESQL_WASM_PATH={}", dest.display());
     println!(
         "cargo::rustc-env=GOOGLESQL_CWASM_PATH={}",
         cwasm_dest.display()
     );
+    println!(
+        "cargo::rustc-env=GOOGLESQL_WASM_ZSTD_PATH={}",
+        zstd_dest.display()
+    );
+    println!("cargo::rustc-env=GOOGLESQL_WASM_SHA256={WASM_SHA256}");
+    Ok(())
+}
+
+/// Compresses the verified wasm for embedding: a copied executable carries the
+/// zstd-compressed module (a few MB) instead of the ~53MB precompiled cwasm;
+/// the runtime JIT-compiles once and caches the serialized module under the
+/// per-user temp cache root, keyed by the wasm SHA. (Under docs.rs the input
+/// is empty — the placeholder only has to be a valid zstd stream; see
+/// `prepare_wasm`.)
+#[cfg(feature = "wasmtime")]
+fn compress_wasm(bytes: &[u8], dest: &Path) -> Result<(), Box<dyn Error>> {
+    let compressed = zstd::stream::encode_all(bytes, 19)
+        .map_err(|e| format!("zstd-compress googlesql.wasm: {e}"))?;
+    fs::write(dest, &compressed).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
     Ok(())
 }
 
