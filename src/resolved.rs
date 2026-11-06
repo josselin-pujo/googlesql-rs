@@ -2086,11 +2086,13 @@ impl Module {
     }
 
     /// Common helper: passes a single handle and returns the string from field 1.
+    /// An absent field decodes as empty for the same proto3 reason as
+    /// [`value_int64`] — an empty string is omitted on the wire, e.g. the value
+    /// of a `''` literal (proto3 omits default-valued fields from the response).
     fn rpc_string(&mut self, svc: i32, mid: i32, ptr: u64) -> Result<String, Error> {
         let resp = self.invoke_handle(svc, mid, ptr)?;
         check_error(&resp)?;
-        pb::read_string_at_field(&resp, 1)
-            .ok_or_else(|| Error::Protocol("string field not found".into()))
+        Ok(pb::read_string_at_field(&resp, 1).unwrap_or_default())
     }
 
     /// Common helper: passes a single handle and returns the int32 from field 1.
